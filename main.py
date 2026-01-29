@@ -3,78 +3,94 @@ import numpy as np
 import time
 import ai_edge_litert.interpreter as litert
 
-# 1. Setup - Path to your INT8 model for maximum speed
+# 1. SETUP & HARDWARE ACCELERATION
 MODEL_PATH = "models/yolo11n-pose_int8.tflite"
-CONF_THRESHOLD = 0.25
-
-# HARDWARE ACCELERATION: Use all 4 cores and XNNPACK
-# This is the single biggest speed boost for the Raspberry Pi
-interpreter = litert.Interpreter(
-    model_path=MODEL_PATH,
-    num_threads=4  # Utilizing all Pi cores
-)
+interpreter = litert.Interpreter(model_path=MODEL_PATH, num_threads=4)
 interpreter.allocate_tensors()
 
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
-input_size = input_details[0]['shape'][1] 
+input_size = input_details[0]['shape'][1]
 
-# 2. Camera Setup - Lower resolution for faster capture
+# 2. JUMPING JACK LOGIC VARIABLES
+count = 0
+stage = "down"  # Stages: "up" or "down"
+
+def calculate_angle(a, b, c):
+    """Calculates angle between three keypoints (e.g., hip, shoulder, elbow)."""
+    a = np.array(a)
+    b = np.array(b)
+    c = np.array(c)
+    radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
+    angle = np.abs(radians * 180.0 / np.pi)
+    if angle > 180.0: angle = 360 - angle
+    return angle
+
+# 3. CAMERA SETUP
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-# 3. Connectivity Edges for Pose
-EDGES = [(5, 6), (5, 7), (7, 9), (6, 8), (8, 10), (5, 11), (6, 12), 
-         (11, 12), (11, 13), (13, 15), (12, 14), (14, 16)]
-
 prev_time = time.time()
 
-print("Optimized Inference Started...")
+print("Jumping Jack Counter Active!")
 while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret: break
+    success, frame = cap.read()
+    if not success: break
 
-    # --- PERFORMANCE FIX 1: FAST PRE-PROCESSING ---
-    # Resizing first, then handling the array.
-    img = cv2.resize(frame, (input_size, input_size), interpolation=cv2.INTER_LINEAR)
-    
-    # INT8 optimization: If your model is INT8, skip the "/ 255.0" math.
-    # Standard INT8 models expect 0-255 UINT8 data.
-    input_tensor = np.expand_dims(img, axis=0).astype(np.uint8)
+    # FAST PRE-PROCESSING
+    img = cv2.resize(frame, (input_size, input_size))
+    # Note: Using float32 for the 'entry door' as required by the model
+    input_tensor = img.astype(np.float32) / 255.0
+    input_tensor = np.expand_dims(input_tensor, axis=0)
 
-    # --- PERFORMANCE FIX 2: ACCELERATED INVOCATION ---
+    # INFERENCE
     interpreter.set_tensor(input_details[0]['index'], input_tensor)
     interpreter.invoke()
     
-    # 4. Get Results
-    output = interpreter.get_tensor(output_details[0]['index'])[0].transpose(1, 0)
-
-    # --- PERFORMANCE FIX 3: TARGETED POST-PROCESSING ---
-    # Find only the top person to avoid looping through 2100 results
-    scores = output[:, 4]
-    best_idx = np.argmax(scores)
+    # OUTPUT PROCESSING
+    output = interpreter.get_tensor(output_details[0]['index'])[0]
+    output = output.T # Transpose to [2100, 56]
     
-    if scores[best_idx] > CONF_THRESHOLD:
-        det = output[best_idx]
-        kpts = det[5:].reshape(17, 3) 
+    # Grab the highest confidence detection
+    best_idx = np.argmax(output[:, 4])
+    if output[best_idx, 4] > 0.4:
+        kpts = output[best_idx, 5:].reshape(17, 3)
         h, w, _ = frame.shape
 
-        for start, end in EDGES:
-            pt1 = (int(kpts[start][0] * w), int(kpts[start][1] * h))
-            pt2 = (int(kpts[end][0] * w), int(kpts[end][1] * h))
-            if kpts[start][2] > 0.5 and kpts[end][2] > 0.5:
-                cv2.line(frame, pt1, pt2, (0, 255, 0), 2)
+        # GET KEYPOINTS (Normalized to pixel values)
+        l_shoulder = [kpts[5][0] * w, kpts[5][1] * h]
+        r_shoulder = [kpts[6][0] * w, kpts[6][1] * h]
+        l_hip = [kpts[11][0] * w, kpts[11][1] * h]
+        r_hip = [kpts[12][0] * w, kpts[12][1] * h]
+        l_elbow = [kpts[7][0] * w, kpts[7][1] * h]
+        r_elbow = [kpts[8][0] * w, kpts[8][1] * h]
 
-    # FPS Display
-    now = time.time()
-    fps = 1 / (now - prev_time)
-    prev_time = now
-    cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+        # CALCULATE ANGLES
+        # Angle between hip, shoulder, and elbow (Armpit angle)
+        l_angle = calculate_angle(l_hip, l_shoulder, l_elbow)
+        r_angle = calculate_angle(r_hip, r_shoulder, r_elbow)
+
+        # JUMPING JACK LOGIC
+        # If arms are above shoulders (angle > 140) and were previously down
+        if l_angle > 140 and r_angle > 140:
+            stage = "up"
+        # If arms come back down (angle < 50) and were previously up, count a rep
+        if l_angle < 50 and r_angle < 50 and stage == "up":
+            stage = "down"
+            count += 1
+            print(f"Rep counted! Total: {count}")
+
+    # UI & FPS
+    fps = 1 / (time.time() - prev_time)
+    prev_time = time.time()
     
-    cv2.imshow("Optimized Pi Pose", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    # HUD
+    cv2.rectangle(frame, (0,0), (250, 100), (0,0,0), -1)
+    cv2.putText(frame, f"REPS: {count}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    cv2.putText(frame, f"FPS: {int(fps)}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 1)
+    
+    cv2.imshow("Pi Jumping Jack Counter", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'): break
 
 cap.release()
 cv2.destroyAllWindows()
