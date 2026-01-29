@@ -4,7 +4,7 @@ import ai_edge_litert.interpreter as litert
 
 # 1. Setup the Interpreter
 # Change this path to your specific pruned/slimmed TFLite model
-MODEL_PATH = "models/yolo11n-pose_float32.tflite"
+MODEL_PATH = "models/yolo11n-pose_int8.tflite"
 interpreter = litert.Interpreter(model_path=MODEL_PATH)
 interpreter.allocate_tensors()
 
